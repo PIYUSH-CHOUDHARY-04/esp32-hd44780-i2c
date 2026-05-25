@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# MODIFY AS PER YOUR DIRECTORY STRUCTURE
+
 #!/bin/bash
 # ==========================================
 # ESP32 / ESP-IDF Central Activation Script
