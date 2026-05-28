@@ -1,5 +1,5 @@
-#ifndef __LCD_H__
-#define __LCD_H__
+#ifndef LCD_H
+#define LCD_H
 
 /**
  * @file lcd.h
@@ -11,36 +11,89 @@
  * - Persistent row pinning
  * - Partial row clearing
  * - ESP-IDF I2C integration
+ * - Thread-safe LCD runtime operations
  *
  * Built on top of the HD44780 low-level driver.
+ *
+ * -----------------------------------------------------------------------------
+ * Usage Model
+ * -----------------------------------------------------------------------------
+ *
+ * Typical lifecycle:
+ *
+ *      lcd_init(...)
+ *          ->
+ *      lcd_printf(), lcd_clear(), lcd_set_cursor(), ...
+ *          ->
+ *      lcd_deinit()
+ *
+ * -----------------------------------------------------------------------------
+ * Threading Model
+ * -----------------------------------------------------------------------------
+ *
+ * - Runtime LCD operations are internally protected using a recursive mutex.
+ * - APIs such as lcd_printf(), lcd_clear(), lcd_row_pin(), etc are thread-safe.
+ * - lcd_init() and lcd_deinit() are NOT thread-safe.
+ *
+ * @warning
+ * lcd_init() must be called once from app_main() before any task starts using
+ * the LCD APIs.
+ *
+ * -----------------------------------------------------------------------------
+ * Design Notes
+ * -----------------------------------------------------------------------------
+ *
+ * - Current implementation manages a singleton LCD device internally.
+ * - I2C transfers are synchronous/blocking.
+ * - Driver internally tracks:
+ *      - cursor state
+ *      - row pinning state
+ *      - LCD initialization state
+ *
+ * -----------------------------------------------------------------------------
+ * Hardware Assumptions
+ * -----------------------------------------------------------------------------
+ *
+ * - HD44780-compatible LCD
+ * - PCF8574 I2C backpack
+ * - 16x2 LCD configuration (default current implementation)
  */
 
 #include <stdint.h>
 #include <esp_err.h>
 #include "hd44780.h"
 #include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/**
+ * @brief Base error code offset for LCD driver.
+ */
 #define ESP_ERR_LCD_BASE                 0x5000
+
+/**
+ * @brief LCD driver error codes.
+ */
 typedef enum {
 
-    // Generic
+    /* Generic */
     LCD_OK                              = ESP_OK,
 
-    // I2C operation failures
+    /* I2C operation failures */
     LCD_ERR_NEW_MASTER_BUS              = ESP_ERR_LCD_BASE + 1,
     LCD_ERR_MASTER_ADD_DEVICE           = ESP_ERR_LCD_BASE + 2,
 
-    // Invalid usage
+    /* Invalid usage */
     LCD_ERR_INVALID_ARG                 = ESP_ERR_INVALID_ARG,
-
-    // State errors
+    LCD_ERR_INVALID_STATE               = ESP_ERR_INVALID_STATE,
+    /* State warnings/errors */
     LCD_WARN_NOTHING_TO_CLEAR           = ESP_ERR_LCD_BASE + 3,
 
-    // HD44780 operation failures
+    /* HD44780 operation failures */
     LCD_ERR_PUTC_FAILED                 = ESP_ERR_LCD_BASE + 4,
     LCD_ERR_GOTOXY_FAILED               = ESP_ERR_LCD_BASE + 5,
     LCD_ERR_CLEAR_FAILED                = ESP_ERR_LCD_BASE + 6,
@@ -49,92 +102,40 @@ typedef enum {
 } lcd_err_t;
 
 /**
- * @brief LCD device descriptor for HD44780 + PCF8574 configuration.
+ * @brief User-provided ESP-IDF I2C configuration.
  *
- * This structure stores:
- * - HD44780 descriptor
- * - I2C bus/device configuration
- * - Cursor state
- * - Row pinning state
- * - ESP-IDF I2C handles
+ * Pass this structure to lcd_init() when custom I2C configuration
+ * is required.
+ *
+ * If NULL is passed to lcd_init(), default configuration values
+ * are used internally.
  */
-struct lcd_i2c {
-   
-    /**
-     * @brief Underlying HD44780 descriptor.
-     */
-    hd44780_t lcd;
-    
-    /**
-     * @brief Number of LCD columns.
-     */
-    const uint8_t lcd_cols;
-
-    /**
-     * @brief I2C device address of PCF8574.
-     */
-    const uint8_t dev_i2c_addr;
+struct lcd_user_handle {
 
     /**
      * @brief SDA GPIO pin number.
      */
-    const uint8_t dev_i2c_sda_pin;
+    uint8_t esp_i2c_sda_pin_usr;
 
     /**
      * @brief SCL GPIO pin number.
      */
-    const uint8_t dev_i2c_scl_pin;
+    uint8_t esp_i2c_scl_pin_usr;
 
     /**
-     * @brief I2C clock frequency in Hz.
+     * @brief ESP-IDF I2C clock source.
      */
-    const uint32_t dev_i2c_freq;
+    uint8_t esp_i2c_clk_src_usr;
 
     /**
      * @brief ESP-IDF I2C controller port.
      */
-    const uint8_t esp_i2c_port;
-
-    /**
-     * @brief LCD row pinning bitmap.
-     *
-     * Bit layout:
-     * - bit0 -> row 0 pinned
-     * - bit1 -> row 1 pinned
-     *
-     * Pinned rows are protected from:
-     * - lcd_printf()
-     * - lcd_clear_row()
-     */
-    uint8_t lcd_row_pinning     : 2;    // b0 for row0, b1 for row1, if set, chars can't be put into that row
-
-    /**
-     * @brief Current cursor row tracked by wrapper layer.
-     */
-    uint8_t lcd_cursor_pos_row;
-
-    /**
-     * @brief Current cursor column tracked by wrapper layer.
-     */
-    uint8_t lcd_cursor_pos_col;
-
-    /**
-     * @brief ESP-IDF I2C master bus handle.
-     */
-    i2c_master_bus_handle_t bus_handle;
-
-    /**
-     * @brief ESP-IDF I2C device handle.
-     */
-    i2c_master_dev_handle_t dev_handle;
+    uint8_t esp_i2c_port_usr;
 };
 
-/**
- * @brief Global LCD device instance.
- */
-extern struct lcd_i2c lcd_dev;
-
-//=============================================== internals (exposed for hd44780)==========================================
+//=============================================================================
+// Internals (exposed for hd44780)
+//=============================================================================
 
 /**
  * @brief Low-level HD44780 write callback.
@@ -142,32 +143,48 @@ extern struct lcd_i2c lcd_dev;
  * This callback is used internally by the HD44780 driver
  * to transmit one byte through the PCF8574 I2C expander.
  *
+ * @note
+ * This API is intended for internal driver usage only.
+ *
  * @param lcd Pointer to HD44780 descriptor.
  * @param data Data byte to transmit.
  *
  * @return
  *      - ESP_OK on success
- *      - ESP_FAIL or ESP-IDF I2C error code on failure
+ *      - ESP-IDF I2C error code on failure
  */
 esp_err_t write_cb(const hd44780_t *lcd, uint8_t data);
 
-//=============================================== API ================================================
+//=============================================================================
+// Public API
+//=============================================================================
 
 /**
  * @brief Initialize LCD driver and underlying I2C bus/device.
  *
  * This function:
  * - Creates I2C master bus
- * - Adds PCF8574 device
- * - Initializes HD44780 LCD
+ * - Adds PCF8574 device onto the bus
+ * - Initializes the HD44780 LCD
+ * - Creates internal synchronization primitives
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
+ * If @p luh is NULL, default I2C configuration values are used.
+ *
+ * @warning
+ * Must be called once from app_main() before any task uses LCD APIs.
+ *
+ * @note
+ * This function is NOT thread-safe.
+ *
+ * @param luh Pointer to user I2C configuration.
+ *            Pass NULL to use default configuration.
  *
  * @return
  *      - LCD_OK on success
  *      - LCD_ERR_** on failure
+ *      - ESP_ERR_INVALID_STATE on invalid initialization sequence
  */
-esp_err_t lcd_init(struct lcd_i2c* lcd_i2c_dev);
+esp_err_t lcd_init(struct lcd_user_handle* luh);
 
 /**
  * @brief Clear entire LCD and reset internal state.
@@ -177,13 +194,15 @@ esp_err_t lcd_init(struct lcd_i2c* lcd_i2c_dev);
  * - Resets cursor position
  * - Clears row pinning state
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
+ * @note
+ * This API is thread-safe.
  *
  * @return
  *      - LCD_OK on success
- *      - LCD_ERR_** code on failure
+ *      - LCD_ERR_CLEAR_FAILED on LCD clear failure
+ *      - ESP_ERR_INVALID_STATE if LCD is not initialized
  */
-esp_err_t lcd_clear(struct lcd_i2c* lcd_i2c_dev);
+esp_err_t lcd_clear(void);
 
 /**
  * @brief Clear only unpinned LCD rows.
@@ -200,14 +219,16 @@ esp_err_t lcd_clear(struct lcd_i2c* lcd_i2c_dev);
  * Cursor positioning assumptions are maintained internally
  * by row pinning and cursor management APIs.
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
+ * @note
+ * This API is thread-safe.
  *
  * @return
  *      - LCD_OK on success
- *      - Positive value if nothing cleared (LCD_WARN_**)
- *      - Negative value on internal failure (LCD_ERR_**)
+ *      - LCD_WARN_NOTHING_TO_CLEAR if both rows are pinned
+ *      - LCD_ERR_** on internal operation failure
+ *      - ESP_ERR_INVALID_STATE if LCD is not initialized
  */
-esp_err_t lcd_clear_row(struct lcd_i2c* lcd_i2c_dev);
+esp_err_t lcd_clear_row(void);
 
 /**
  * @brief Print formatted text to LCD.
@@ -216,18 +237,28 @@ esp_err_t lcd_clear_row(struct lcd_i2c* lcd_i2c_dev);
  *
  * Behavior depends on current row pinning state.
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
- * @param fmt Format string.
+ * The driver internally:
+ * - clears writable regions
+ * - preserves pinned rows
+ * - restores cursor position after printing
+ *
+ * @note
+ * Maximum printable length is bounded by LCD dimensions.
+ *
+ * @note
+ * This API is thread-safe.
+ *
+ * @param fmt printf-style format string.
  * @param ... Variable arguments.
  *
  * @return
- *      - Number of characters written
+ *      - Number of characters formatted
  *      - Negative value on failure
  */
-int lcd_printf(struct lcd_i2c* lcd_i2c_dev, const char *fmt, ...);
+int lcd_printf(const char *fmt, ...);
 
 /**
- * @brief Pin a row to make its contents persistent.
+ * @brief Pin an LCD row to preserve its contents.
  *
  * Pinned rows are protected from:
  * - lcd_printf()
@@ -236,28 +267,38 @@ int lcd_printf(struct lcd_i2c* lcd_i2c_dev, const char *fmt, ...);
  * Cursor position is automatically updated to the next
  * writable region.
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
+ * @note
+ * This API is thread-safe.
+ *
  * @param row LCD row number.
  *
  * @return
  *      - LCD_OK on success
- *      - LCD_ERR_** on failure
+ *      - LCD_ERR_INVALID_ARG on invalid row
+ *      - LCD_ERR_GOTOXY_FAILED on cursor positioning failure
+ *      - ESP_ERR_INVALID_STATE if LCD is not initialized
  */
-esp_err_t lcd_row_pin(struct lcd_i2c* lcd_i2c_dev, uint8_t row);
+esp_err_t lcd_row_pin(uint8_t row);
 
 /**
  * @brief Remove row pinning.
  *
  * After unpinning, the row becomes writable again.
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
+ * Internal cursor state is also updated.
+ *
+ * @note
+ * This API is thread-safe.
+ *
  * @param row LCD row number.
  *
  * @return
  *      - LCD_OK on success
- *      - LCD_ERR_** on failure
+ *      - LCD_ERR_INVALID_ARG on invalid row
+ *      - LCD_ERR_GOTOXY_FAILED on cursor positioning failure
+ *      - ESP_ERR_INVALID_STATE if LCD is not initialized
  */
-esp_err_t lcd_row_unpin(struct lcd_i2c* lcd_i2c_dev, uint8_t row);
+esp_err_t lcd_row_unpin(uint8_t row);
 
 /**
  * @brief Set LCD cursor position.
@@ -266,18 +307,43 @@ esp_err_t lcd_row_unpin(struct lcd_i2c* lcd_i2c_dev, uint8_t row);
  * - LCD hardware cursor
  * - Internal wrapper cursor state
  *
- * @param lcd_i2c_dev Pointer to LCD descriptor.
+ * @note
+ * This API is thread-safe.
+ *
  * @param row Target row.
  * @param col Target column.
  *
  * @return
  *      - LCD_OK on success
- *      - LCD_ERR_** on failure
+ *      - LCD_ERR_INVALID_ARG on invalid row/column
+ *      - LCD_ERR_GOTOXY_FAILED on LCD cursor update failure
+ *      - ESP_ERR_INVALID_STATE if LCD is not initialized
  */
-esp_err_t lcd_set_cursor(struct lcd_i2c* lcd_i2c_dev, uint8_t row, uint8_t col);
+esp_err_t lcd_set_cursor(uint8_t row, uint8_t col);
+
+/**
+ * @brief Deinitialize LCD driver and underlying I2C resources.
+ *
+ * This function:
+ * - Removes I2C device from bus
+ * - Deletes I2C master bus
+ * - Resets internal LCD state
+ * - Deletes synchronization primitives
+ *
+ * @warning
+ * No task should access LCD APIs after this function returns.
+ *
+ * @note
+ * This function is NOT thread-safe.
+ *
+ * @return
+ *      - LCD_OK on success
+ *      - ESP_ERR_INVALID_STATE if LCD is not initialized
+ */
+esp_err_t lcd_deinit(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif  
+#endif

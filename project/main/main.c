@@ -33,6 +33,7 @@
 #include "esp_timer.h"
 
 #include "lcd.h"
+#include "hd44780.h"
 #include "logging.h"
 
 /* ---- timing knobs --------------------------------------------------- */
@@ -67,15 +68,19 @@ static void stage_banner(const char *title)
 
 
 /* ---- main ----------------------------------------------------------- */
+
 void app_main(void)
 {
+
     print_chip_info();
+   
+
 
     /* ---------------------------------------------------------------
      * Stage 0 : bring up the LCD
      * --------------------------------------------------------------- */
     stage_banner("init");
-    esp_err_t ret = lcd_init(&lcd_dev);
+    esp_err_t ret = lcd_init(NULL);
     if (ret != LCD_OK) {
         PRINT_MSG("lcd_init() failed: 0x%x\n", ret);
         PRINT_MSG("Check wiring, I2C address, contrast pot, and power.\n");
@@ -88,7 +93,7 @@ void app_main(void)
      * Shows: basic lcd_printf to row 0 (default cursor).
      * --------------------------------------------------------------- */
     stage_banner("greeting");
-    lcd_printf(&lcd_dev, " Hello, ESP32! ");
+    lcd_printf(" Hello, ESP32! ");
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
     /* ---------------------------------------------------------------
@@ -97,8 +102,7 @@ void app_main(void)
      *        the column count. Anything past 32 chars is dropped.
      * --------------------------------------------------------------- */
     stage_banner("auto-wrap");
-    lcd_printf(&lcd_dev,
-               "1234567890ABCDEFGHIJabcdefghij...");  /* 32+ chars */
+    lcd_printf("1234567890ABCDEFGHIJabcdefghij...");  /* 32+ chars */
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
     /* ---------------------------------------------------------------
@@ -107,13 +111,13 @@ void app_main(void)
      *        specific row.
      * --------------------------------------------------------------- */
     stage_banner("explicit cursor");
-    lcd_clear(&lcd_dev);
-    lcd_set_cursor(&lcd_dev, 0, 0);
-    lcd_printf(&lcd_dev, "Row 0 top");
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_printf("Row 0 top");
     vTaskDelay(pdMS_TO_TICKS(SHORT_DELAY_MS));
 
-    lcd_set_cursor(&lcd_dev, 1, 0);
-    lcd_printf(&lcd_dev, "Row 1 bottom");
+    lcd_set_cursor(1, 0);
+    lcd_printf("Row 1 bottom");
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
     /* ---------------------------------------------------------------
@@ -124,18 +128,18 @@ void app_main(void)
      *        put.
      * --------------------------------------------------------------- */
     stage_banner("row pinning");
-    lcd_clear(&lcd_dev);
-    lcd_set_cursor(&lcd_dev, 0, 0);
-    lcd_printf(&lcd_dev, "  Status: OK  ");
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_printf("  Status: OK  ");
 
-    if (lcd_row_pin(&lcd_dev, 0) != LCD_OK) {
+    if (lcd_row_pin(0) != LCD_OK) {
         PRINT_MSG("row pin failed\n");
     } else {
         PRINT_MSG("row 0 pinned\n");
     }
 
     for (int i = 0; i < COUNTER_MAX; i++) {
-        lcd_printf(&lcd_dev, "Counter: %d", i);
+        lcd_printf("Counter: %d", i);
         vTaskDelay(pdMS_TO_TICKS(COUNTER_TICK_MS));
     }
 
@@ -144,10 +148,10 @@ void app_main(void)
      * Shows: row 0 becomes writable again after lcd_row_unpin().
      * --------------------------------------------------------------- */
     stage_banner("unpin");
-    if (lcd_row_unpin(&lcd_dev, 0) != LCD_OK) {
+    if (lcd_row_unpin(0) != LCD_OK) {
         PRINT_MSG("row unpin failed\n");
     }
-    lcd_printf(&lcd_dev, " Row 0 free again ");
+    lcd_printf(" Row 0 free again ");
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
     /* ---------------------------------------------------------------
@@ -155,15 +159,15 @@ void app_main(void)
      * Shows: pinning the bottom row instead of the top.
      * --------------------------------------------------------------- */
     stage_banner("pin row 1");
-    lcd_clear(&lcd_dev);
-    lcd_set_cursor(&lcd_dev, 1, 0);
-    lcd_printf(&lcd_dev, "  -- footer --  ");
-    lcd_row_pin(&lcd_dev, 1);
+    lcd_clear();
+    lcd_set_cursor(1, 0);
+    lcd_printf("  -- footer --  ");
+    lcd_row_pin(1);
 
-    lcd_printf(&lcd_dev, "Heap: %" PRIu32, esp_get_free_heap_size());
+    lcd_printf("Heap: %" PRIu32, esp_get_free_heap_size());
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
-    lcd_printf(&lcd_dev, "Time: %lld ms",
+    lcd_printf("Time: %lld ms",
                (long long)(esp_timer_get_time() / 1000));
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
@@ -172,18 +176,18 @@ void app_main(void)
      * Shows: with row 1 pinned, lcd_clear_row() wipes only row 0.
      * --------------------------------------------------------------- */
     stage_banner("selective clear");
-    lcd_clear_row(&lcd_dev);   /* row 1 still pinned, so only row 0 wiped */
+    lcd_clear_row();   /* row 1 still pinned, so only row 0 wiped */
     vTaskDelay(pdMS_TO_TICKS(SHORT_DELAY_MS));
-    lcd_printf(&lcd_dev, "Row 0 cleared");
+    lcd_printf("Row 0 cleared");
     vTaskDelay(pdMS_TO_TICKS(STAGE_DELAY_MS));
 
     /* ---------------------------------------------------------------
      * Stage 8 : final cleanup
      * --------------------------------------------------------------- */
     stage_banner("done");
-    lcd_row_unpin(&lcd_dev, 1);
-    lcd_clear(&lcd_dev);
-    lcd_printf(&lcd_dev, "  demo complete  ");
+    lcd_row_unpin(1);
+    lcd_clear();
+    lcd_printf("  demo complete  ");
 
     PRINT_MSG("All stages finished. Idle loop entering.\n");
 
@@ -192,3 +196,4 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
+
